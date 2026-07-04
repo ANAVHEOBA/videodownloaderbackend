@@ -67,8 +67,6 @@ pub async fn extract_metadata(
     env: &Environment,
     source_url: &str,
 ) -> Result<ExtractedMediaMetadata> {
-    ensure_binary_exists(&env.ytdlp_binary_path)?;
-
     let args = vec![
         OsString::from("--dump-single-json"),
         OsString::from("--no-playlist"),
@@ -120,8 +118,6 @@ pub async fn download_highest_quality(
     env: &Environment,
     record: &DownloadRequestRecord,
 ) -> Result<DownloadedMedia> {
-    ensure_binary_exists(&env.ytdlp_binary_path)?;
-
     let temp_dir = env.temp_dir.join(record.id.to_string());
 
     if let Some(path) = load_downloaded_file_path(&temp_dir).await? {
@@ -196,7 +192,8 @@ async fn run_command(
     timeout_seconds: u64,
     args: &[OsString],
 ) -> Result<std::process::Output> {
-    let mut command = Command::new(&env.ytdlp_binary_path);
+    let ytdlp_command = resolve_ytdlp_command(&env.ytdlp_binary_path)?;
+    let mut command = Command::new(&ytdlp_command);
     command
         .args(args.iter().map(OsStr::new))
         .stdout(Stdio::piped())
@@ -205,7 +202,12 @@ async fn run_command(
     let output = timeout(Duration::from_secs(timeout_seconds), command.output())
         .await
         .with_context(|| format!("yt-dlp timed out after {timeout_seconds} seconds"))?
-        .context("failed to spawn yt-dlp")?;
+        .with_context(|| {
+            format!(
+                "failed to spawn yt-dlp using resolved command `{}`",
+                Path::new(&ytdlp_command).display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
@@ -215,12 +217,25 @@ async fn run_command(
     Ok(output)
 }
 
-fn ensure_binary_exists(path: &Path) -> Result<()> {
+fn resolve_ytdlp_command(path: &Path) -> Result<OsString> {
     if path.exists() {
-        Ok(())
-    } else {
-        bail!("yt-dlp binary not found at `{}`", path.display())
+        return Ok(path.as_os_str().to_os_string());
     }
+
+    if path.components().count() == 1 {
+        return Ok(path.as_os_str().to_os_string());
+    }
+
+    if let Some(file_name) = path.file_name() {
+        tracing::warn!(
+            configured_path = %path.display(),
+            fallback_command = %Path::new(file_name).display(),
+            "configured yt-dlp path does not exist; falling back to PATH lookup"
+        );
+        return Ok(file_name.to_os_string());
+    }
+
+    bail!("yt-dlp binary not found at `{}`", path.display())
 }
 
 fn best_thumbnail_url(info: &YtDlpInfo) -> Option<String> {
@@ -287,8 +302,16 @@ fn ffmpeg_location_argument(value: &str) -> Option<OsString> {
     }
 
     let path = Path::new(trimmed);
-    if path.is_absolute() || path.components().count() > 1 || path.exists() {
+    if path.exists() {
         return Some(OsString::from(trimmed));
+    }
+
+    if path.is_absolute() || path.components().count() > 1 {
+        tracing::warn!(
+            configured_path = %path.display(),
+            "configured ffmpeg path does not exist; falling back to PATH lookup"
+        );
+        return None;
     }
 
     None
@@ -452,7 +475,7 @@ mod tests {
         YOUTUBE_ADAPTIVE_MAX_HEIGHT, YOUTUBE_PROGRESSIVE_MAX_HEIGHT, cleanup_download_dir,
         extract_downloaded_file_path, ffmpeg_location_argument, find_primary_download_file,
         load_downloaded_file_path, persist_downloaded_file_path, public_filename,
-        refresh_download_lease, youtube_preferred_format,
+        refresh_download_lease, resolve_ytdlp_command, youtube_preferred_format,
     };
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -587,9 +610,20 @@ mod tests {
             ffmpeg_location_argument("/opt/homebrew/bin/ffmpeg"),
             Some(OsString::from("/opt/homebrew/bin/ffmpeg"))
         );
-        assert_eq!(
-            ffmpeg_location_argument("./bin/ffmpeg"),
-            Some(OsString::from("./bin/ffmpeg"))
-        );
+        assert_eq!(ffmpeg_location_argument("./bin/ffmpeg"), None);
+    }
+
+    #[test]
+    fn falls_back_to_path_lookup_for_missing_absolute_ytdlp_path() {
+        let resolved = resolve_ytdlp_command(Path::new("/definitely-missing/bin/yt-dlp"))
+            .expect("missing absolute path should fall back to the binary name");
+        assert_eq!(resolved, OsString::from("yt-dlp"));
+    }
+
+    #[test]
+    fn keeps_plain_ytdlp_command_names() {
+        let resolved = resolve_ytdlp_command(Path::new("yt-dlp"))
+            .expect("plain command names should be accepted");
+        assert_eq!(resolved, OsString::from("yt-dlp"));
     }
 }
