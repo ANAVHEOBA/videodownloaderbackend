@@ -43,6 +43,10 @@ pub struct Environment {
     pub enable_spotify: bool,
     pub enable_soundcloud: bool,
     pub cookies_file_path: Option<PathBuf>,
+    pub cookies_file_content_base64: Option<String>,
+    pub tiktok_fallback_enabled: bool,
+    pub tiktok_fallback_api_url: String,
+    pub instagram_oembed_fallback_enabled: bool,
     pub ffmpeg_enabled: bool,
     pub ffmpeg_binary_path: String,
     pub temp_dir: PathBuf,
@@ -101,6 +105,14 @@ impl Environment {
             enable_spotify: read_parse("ENABLE_SPOTIFY")?,
             enable_soundcloud: read_parse("ENABLE_SOUNDCLOUD")?,
             cookies_file_path: read_optional_var("COOKIES_FILE_PATH").map(PathBuf::from),
+            cookies_file_content_base64: read_optional_var("COOKIES_FILE_CONTENT_BASE64"),
+            tiktok_fallback_enabled: read_parse_or("TIKTOK_FALLBACK_ENABLED", true)?,
+            tiktok_fallback_api_url: read_optional_var("TIKTOK_FALLBACK_API_URL")
+                .unwrap_or_else(|| "https://tikwm.com/api/".to_owned()),
+            instagram_oembed_fallback_enabled: read_parse_or(
+                "INSTAGRAM_OEMBED_FALLBACK_ENABLED",
+                true,
+            )?,
             ffmpeg_enabled: read_parse("FFMPEG_ENABLED")?,
             ffmpeg_binary_path: read_var("FFMPEG_BINARY_PATH")?,
             temp_dir: PathBuf::from(read_var("TEMP_DIR")?),
@@ -127,4 +139,17 @@ where
     let raw = read_var(key)?;
     raw.parse::<T>()
         .map_err(|error| anyhow::anyhow!("invalid `{key}` value `{raw}`: {error}"))
+}
+
+fn read_parse_or<T>(key: &str, default: T) -> Result<T>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    match read_optional_var(key) {
+        Some(raw) => raw
+            .parse::<T>()
+            .map_err(|error| anyhow::anyhow!("invalid `{key}` value `{raw}`: {error}")),
+        None => Ok(default),
+    }
 }

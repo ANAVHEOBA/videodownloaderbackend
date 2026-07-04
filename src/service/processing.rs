@@ -24,7 +24,7 @@ use crate::{
         },
         schema::{ProcessingRequestResponse, ResolveUrlRequest, ResolveUrlResponse},
     },
-    service::{providers::detect_provider, yt_dlp},
+    service::{fallbacks, providers::detect_provider, yt_dlp},
 };
 
 pub async fn resolve_url(
@@ -75,76 +75,37 @@ pub async fn resolve_url(
     })?;
 
     match yt_dlp::extract_metadata(&state.env, source_url).await {
-        Ok(metadata) => {
-            if let Some(duration_seconds) = metadata.duration_seconds {
-                if duration_seconds > state.env.max_video_duration_seconds as i64 {
-                    let error_message = format!(
-                        "requested media duration of {duration_seconds} seconds exceeds the configured maximum of {} seconds",
-                        state.env.max_video_duration_seconds
-                    );
-
-                    if let Err(db_error) =
-                        crud::mark_download_request_failed(&state.db, request_id, &error_message)
-                            .await
-                    {
-                        tracing::error!(
-                            ?db_error,
-                            request_id = %request_id,
-                            "failed to mark oversized request as failed"
-                        );
-                    }
-
-                    return Err(ApiError::bad_request(
-                        "requested media exceeds the maximum allowed duration",
-                    ));
-                }
-            }
-
-            let record = crud::mark_download_request_resolved(
-                &state.db,
-                request_id,
-                &ResolvedDownloadRequest {
-                    status: DOWNLOAD_STATUS_RESOLVED.to_owned(),
-                    title: Some(metadata.title),
-                    thumbnail_url: metadata.thumbnail_url,
-                    duration_seconds: metadata.duration_seconds,
-                    uploader: metadata.uploader,
-                    extractor: metadata.extractor,
-                    webpage_url: Some(metadata.webpage_url),
-                },
-            )
-            .await
-            .map_err(|error| {
-                tracing::error!(?error, request_id = %request_id, "failed to update resolved request");
-                ApiError::internal("failed to update resolved request")
-            })?;
-
-            Ok(ResolveUrlResponse {
-                request: ProcessingRequestResponse::from_record(record),
-            })
-        }
+        Ok(metadata) => persist_resolved_metadata(state, request_id, metadata).await,
         Err(error) => {
-            let error_message = error.to_string();
-
-            if let Err(db_error) =
-                crud::mark_download_request_failed(&state.db, request_id, &error_message).await
-            {
-                tracing::error!(
-                    ?db_error,
-                    request_id = %request_id,
-                    "failed to mark request as failed"
-                );
-            }
-
-            tracing::error!(
+            tracing::warn!(
                 ?error,
                 request_id = %request_id,
-                "yt-dlp metadata extraction failed"
+                provider,
+                "yt-dlp metadata extraction failed; trying provider fallback"
             );
 
-            Err(ApiError::service_unavailable(
-                "failed to extract media metadata from the supplied URL",
-            ))
+            match fallbacks::extract_metadata(&state.env, &state.http_client, provider, source_url)
+                .await
+            {
+                Ok(Some(metadata)) => persist_resolved_metadata(state, request_id, metadata).await,
+                Ok(None) => {
+                    mark_failed_after_metadata_error(state, request_id, &error).await;
+                    Err(metadata_failure_to_api_error(&error))
+                }
+                Err(fallback_error) => {
+                    let combined_error =
+                        anyhow::anyhow!("{error}; provider fallback failed: {fallback_error}");
+                    mark_failed_after_metadata_error(state, request_id, &combined_error).await;
+                    tracing::error!(
+                        ?error,
+                        ?fallback_error,
+                        request_id = %request_id,
+                        provider,
+                        "metadata extraction failed"
+                    );
+                    Err(metadata_failure_to_api_error(&error))
+                }
+            }
         }
     }
 }
@@ -177,12 +138,7 @@ pub async fn download_request(state: &AppState, request_id: Uuid) -> Result<Resp
 
     let _download_guard = state.download_coordinator.acquire(request_id).await;
 
-    let downloaded = yt_dlp::download_highest_quality(&state.env, &record)
-        .await
-        .map_err(|error| {
-            tracing::error!(?error, request_id = %request_id, "yt-dlp download failed");
-            ApiError::service_unavailable("failed to download the requested media")
-        })?;
+    let downloaded = download_with_best_available_strategy(state, &record).await?;
 
     let filename = downloaded.filename.clone();
     let cleanup_dir = downloaded.temp_dir.clone();
@@ -262,6 +218,160 @@ fn normalize_url(url: &Url) -> String {
     let mut normalized = url.clone();
     normalized.set_fragment(None);
     normalized.to_string()
+}
+
+async fn persist_resolved_metadata(
+    state: &AppState,
+    request_id: Uuid,
+    metadata: yt_dlp::ExtractedMediaMetadata,
+) -> Result<ResolveUrlResponse, ApiError> {
+    if let Some(duration_seconds) = metadata.duration_seconds {
+        if duration_seconds > state.env.max_video_duration_seconds as i64 {
+            let error_message = format!(
+                "requested media duration of {duration_seconds} seconds exceeds the configured maximum of {} seconds",
+                state.env.max_video_duration_seconds
+            );
+
+            if let Err(db_error) =
+                crud::mark_download_request_failed(&state.db, request_id, &error_message).await
+            {
+                tracing::error!(
+                    ?db_error,
+                    request_id = %request_id,
+                    "failed to mark oversized request as failed"
+                );
+            }
+
+            return Err(ApiError::bad_request(
+                "requested media exceeds the maximum allowed duration",
+            ));
+        }
+    }
+
+    let record = crud::mark_download_request_resolved(
+        &state.db,
+        request_id,
+        &ResolvedDownloadRequest {
+            status: DOWNLOAD_STATUS_RESOLVED.to_owned(),
+            title: Some(metadata.title),
+            thumbnail_url: metadata.thumbnail_url,
+            duration_seconds: metadata.duration_seconds,
+            uploader: metadata.uploader,
+            extractor: metadata.extractor,
+            webpage_url: Some(metadata.webpage_url),
+        },
+    )
+    .await
+    .map_err(|error| {
+        tracing::error!(?error, request_id = %request_id, "failed to update resolved request");
+        ApiError::internal("failed to update resolved request")
+    })?;
+
+    Ok(ResolveUrlResponse {
+        request: ProcessingRequestResponse::from_record(record),
+    })
+}
+
+async fn mark_failed_after_metadata_error(
+    state: &AppState,
+    request_id: Uuid,
+    error: &anyhow::Error,
+) {
+    let error_message = error.to_string();
+
+    if let Err(db_error) =
+        crud::mark_download_request_failed(&state.db, request_id, &error_message).await
+    {
+        tracing::error!(
+            ?db_error,
+            request_id = %request_id,
+            "failed to mark request as failed"
+        );
+    }
+}
+
+async fn download_with_best_available_strategy(
+    state: &AppState,
+    record: &DownloadRequestRecord,
+) -> Result<yt_dlp::DownloadedMedia, ApiError> {
+    if fallbacks::should_prefer_direct_download(record) {
+        match fallbacks::download_direct_highest_quality(&state.env, &state.http_client, record)
+            .await
+        {
+            Ok(Some(downloaded)) => return Ok(downloaded),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    ?error,
+                    request_id = %record.id,
+                    provider = %record.provider,
+                    "preferred provider fallback download failed; trying yt-dlp"
+                );
+            }
+        }
+    }
+
+    match yt_dlp::download_highest_quality(&state.env, record).await {
+        Ok(downloaded) => Ok(downloaded),
+        Err(error) => {
+            tracing::warn!(
+                ?error,
+                request_id = %record.id,
+                provider = %record.provider,
+                "yt-dlp download failed; trying provider fallback"
+            );
+
+            match fallbacks::download_direct_highest_quality(&state.env, &state.http_client, record)
+                .await
+            {
+                Ok(Some(downloaded)) => Ok(downloaded),
+                Ok(None) => Err(download_failure_to_api_error(&error)),
+                Err(fallback_error) => {
+                    tracing::error!(
+                        ?error,
+                        ?fallback_error,
+                        request_id = %record.id,
+                        provider = %record.provider,
+                        "download failed"
+                    );
+                    Err(download_failure_to_api_error(&error))
+                }
+            }
+        }
+    }
+}
+
+fn metadata_failure_to_api_error(error: &anyhow::Error) -> ApiError {
+    extraction_failure_to_api_error(
+        error,
+        "failed to extract media metadata from the supplied URL",
+    )
+}
+
+fn download_failure_to_api_error(error: &anyhow::Error) -> ApiError {
+    extraction_failure_to_api_error(error, "failed to download the requested media")
+}
+
+fn extraction_failure_to_api_error(error: &anyhow::Error, temporary_message: &str) -> ApiError {
+    match yt_dlp::classify_failure(error) {
+        yt_dlp::YtDlpFailureKind::AuthenticationRequired => ApiError::unprocessable(
+            "authentication_required",
+            "this media requires provider cookies or a provider-specific fallback before it can be downloaded",
+        ),
+        yt_dlp::YtDlpFailureKind::DrmProtected => ApiError::unprocessable(
+            "drm_protected",
+            "this provider uses DRM-protected media and cannot be downloaded by this backend",
+        ),
+        yt_dlp::YtDlpFailureKind::Unsupported => ApiError::unprocessable(
+            "unsupported_extractor",
+            "this URL is not supported by the configured extraction runtime",
+        ),
+        yt_dlp::YtDlpFailureKind::Unavailable => ApiError::unprocessable(
+            "media_unavailable",
+            "this media is unavailable, private, deleted, or blocked by the provider",
+        ),
+        yt_dlp::YtDlpFailureKind::Temporary => ApiError::service_unavailable(temporary_message),
+    }
 }
 
 fn build_content_disposition(

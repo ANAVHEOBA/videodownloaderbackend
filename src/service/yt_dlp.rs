@@ -6,6 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
+use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
 use tokio::{fs, process::Command, time::timeout};
 use uuid::Uuid;
@@ -24,6 +25,16 @@ const UNKNOWN_VIDEO_EXTENSION: &str = ".unknown_video";
 const UNKNOWN_AUDIO_EXTENSION: &str = ".unknown_audio";
 const YOUTUBE_PROGRESSIVE_MAX_HEIGHT: u16 = 1080;
 const YOUTUBE_ADAPTIVE_MAX_HEIGHT: u16 = 720;
+const COOKIE_FILE_FROM_ENV: &str = "yt-dlp-cookies.txt";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YtDlpFailureKind {
+    AuthenticationRequired,
+    DrmProtected,
+    Unsupported,
+    Unavailable,
+    Temporary,
+}
 
 pub struct ExtractedMediaMetadata {
     pub title: String,
@@ -67,13 +78,14 @@ pub async fn extract_metadata(
     env: &Environment,
     source_url: &str,
 ) -> Result<ExtractedMediaMetadata> {
-    let args = vec![
+    let mut args = vec![
         OsString::from("--dump-single-json"),
         OsString::from("--no-playlist"),
         OsString::from("--skip-download"),
         OsString::from("--no-warnings"),
-        OsString::from(source_url),
     ];
+    args.extend(cookie_args(env).await?);
+    args.push(OsString::from(source_url));
 
     let output = run_command(env, env.ytdlp_metadata_timeout_seconds, &args).await?;
 
@@ -152,6 +164,7 @@ pub async fn download_highest_quality(
         OsString::from("--max-filesize"),
         OsString::from(env.max_download_bytes.to_string()),
     ];
+    args.extend(cookie_args(env).await?);
 
     if env.ffmpeg_enabled {
         if let Some(ffmpeg_location) = ffmpeg_location_argument(&env.ffmpeg_binary_path) {
@@ -217,6 +230,65 @@ async fn run_command(
     Ok(output)
 }
 
+pub fn classify_failure(error: &anyhow::Error) -> YtDlpFailureKind {
+    let message = error.to_string().to_ascii_lowercase();
+
+    if contains_any(
+        &message,
+        &[
+            "use --cookies-from-browser or --cookies",
+            "login",
+            "log in",
+            "sign in",
+            "authentication",
+            "private video",
+            "private content",
+            "not comfortable for some audiences",
+            "age-restricted",
+            "age restricted",
+            "empty media response",
+        ],
+    ) {
+        return YtDlpFailureKind::AuthenticationRequired;
+    }
+
+    if contains_any(&message, &["known to use drm protection", "drm protected"]) {
+        return YtDlpFailureKind::DrmProtected;
+    }
+
+    if contains_any(
+        &message,
+        &[
+            "unsupported url",
+            "unsupported site",
+            "no suitable extractor",
+            "not currently supported",
+        ],
+    ) {
+        return YtDlpFailureKind::Unsupported;
+    }
+
+    if contains_any(
+        &message,
+        &[
+            "video unavailable",
+            "this video is unavailable",
+            "this post is unavailable",
+            "this content isn't available",
+            "this video has been deleted",
+            "not found",
+            "copyright",
+            "blocked",
+            "geo-restricted",
+            "geo restricted",
+        ],
+    ) {
+        return YtDlpFailureKind::Unavailable;
+    }
+
+    YtDlpFailureKind::Temporary
+}
+
 fn resolve_ytdlp_command(path: &Path) -> Result<OsString> {
     if path.exists() {
         return Ok(path.as_os_str().to_os_string());
@@ -257,6 +329,52 @@ fn best_thumbnail_url(info: &YtDlpInfo) -> Option<String> {
             .max_by_key(|(score, _)| *score)
             .map(|(_, url)| url)
     })
+}
+
+async fn cookie_args(env: &Environment) -> Result<Vec<OsString>> {
+    let Some(cookie_file) = resolve_cookie_file(env).await? else {
+        return Ok(Vec::new());
+    };
+
+    Ok(vec![
+        OsString::from("--cookies"),
+        cookie_file.as_os_str().to_os_string(),
+    ])
+}
+
+async fn resolve_cookie_file(env: &Environment) -> Result<Option<PathBuf>> {
+    if let Some(path) = &env.cookies_file_path {
+        if fs::try_exists(path)
+            .await
+            .with_context(|| format!("failed to check cookies file `{}`", path.display()))?
+        {
+            return Ok(Some(path.clone()));
+        }
+
+        bail!("configured cookies file does not exist: {}", path.display());
+    }
+
+    let Some(encoded) = &env.cookies_file_content_base64 else {
+        return Ok(None);
+    };
+
+    let bytes = general_purpose::STANDARD
+        .decode(encoded.trim())
+        .context("COOKIES_FILE_CONTENT_BASE64 is not valid base64")?;
+    let path = env.temp_dir.join(COOKIE_FILE_FROM_ENV);
+
+    fs::create_dir_all(&env.temp_dir)
+        .await
+        .with_context(|| format!("failed to create temp dir `{}`", env.temp_dir.display()))?;
+    fs::write(&path, bytes)
+        .await
+        .with_context(|| format!("failed to write cookies file `{}`", path.display()))?;
+
+    Ok(Some(path))
+}
+
+fn contains_any(message: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| message.contains(needle))
 }
 
 fn preferred_format(record: &DownloadRequestRecord, ffmpeg_enabled: bool) -> String {
@@ -340,10 +458,12 @@ pub async fn cleanup_download_dir(temp_dir: PathBuf, token: String) {
 
 async fn load_downloaded_file_path(dir: &Path) -> Result<Option<PathBuf>> {
     let marker_path = dir.join(DOWNLOADED_FILE_PATH_FILE);
-    if !fs::try_exists(&marker_path)
-        .await
-        .with_context(|| format!("failed to check download marker `{}`", marker_path.display()))?
-    {
+    if !fs::try_exists(&marker_path).await.with_context(|| {
+        format!(
+            "failed to check download marker `{}`",
+            marker_path.display()
+        )
+    })? {
         return Ok(None);
     }
 
@@ -366,7 +486,12 @@ async fn persist_downloaded_file_path(dir: &Path, path: &Path) -> Result<()> {
     let marker_path = dir.join(DOWNLOADED_FILE_PATH_FILE);
     fs::write(&marker_path, path.as_os_str().as_encoded_bytes())
         .await
-        .with_context(|| format!("failed to write download marker `{}`", marker_path.display()))
+        .with_context(|| {
+            format!(
+                "failed to write download marker `{}`",
+                marker_path.display()
+            )
+        })
 }
 
 fn extract_downloaded_file_path(stdout: &[u8], temp_dir: &Path) -> Result<PathBuf> {
@@ -414,10 +539,7 @@ async fn find_primary_download_file(dir: &Path) -> Result<Option<PathBuf>> {
             continue;
         };
 
-        if name.starts_with('.')
-            || name.ends_with(".part")
-            || name.ends_with(".ytdl")
-        {
+        if name.starts_with('.') || name.ends_with(".part") || name.ends_with(".ytdl") {
             continue;
         }
 
@@ -432,9 +554,12 @@ async fn find_primary_download_file(dir: &Path) -> Result<Option<PathBuf>> {
 }
 
 async fn validate_download_size(env: &Environment, path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path)
-        .await
-        .with_context(|| format!("failed to read downloaded media metadata `{}`", path.display()))?;
+    let metadata = fs::metadata(path).await.with_context(|| {
+        format!(
+            "failed to read downloaded media metadata `{}`",
+            path.display()
+        )
+    })?;
 
     if metadata.len() > env.max_download_bytes {
         bail!(
@@ -472,10 +597,11 @@ mod tests {
     use tokio::fs;
 
     use super::{
-        YOUTUBE_ADAPTIVE_MAX_HEIGHT, YOUTUBE_PROGRESSIVE_MAX_HEIGHT, cleanup_download_dir,
-        extract_downloaded_file_path, ffmpeg_location_argument, find_primary_download_file,
-        load_downloaded_file_path, persist_downloaded_file_path, public_filename,
-        refresh_download_lease, resolve_ytdlp_command, youtube_preferred_format,
+        YOUTUBE_ADAPTIVE_MAX_HEIGHT, YOUTUBE_PROGRESSIVE_MAX_HEIGHT, YtDlpFailureKind,
+        classify_failure, cleanup_download_dir, extract_downloaded_file_path,
+        ffmpeg_location_argument, find_primary_download_file, load_downloaded_file_path,
+        persist_downloaded_file_path, public_filename, refresh_download_lease,
+        resolve_ytdlp_command, youtube_preferred_format,
     };
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -489,7 +615,9 @@ mod tests {
     #[tokio::test]
     async fn finds_primary_download_file_and_ignores_temp_artifacts() {
         let dir = unique_temp_dir("primary-file");
-        fs::create_dir_all(&dir).await.expect("dir should be created");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("dir should be created");
         fs::write(dir.join(".cleanup-token"), "token")
             .await
             .expect("marker should be written");
@@ -510,13 +638,17 @@ mod tests {
             Some("clip.mp4")
         );
 
-        fs::remove_dir_all(&dir).await.expect("dir should be removed");
+        fs::remove_dir_all(&dir)
+            .await
+            .expect("dir should be removed");
     }
 
     #[tokio::test]
     async fn cleanup_only_removes_the_latest_lease_holder() {
         let dir = unique_temp_dir("cleanup-token");
-        fs::create_dir_all(&dir).await.expect("dir should be created");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("dir should be created");
         fs::write(dir.join("clip.mp4"), b"video")
             .await
             .expect("media file should be written");
@@ -530,13 +662,17 @@ mod tests {
 
         cleanup_download_dir(dir.clone(), first).await;
         assert!(
-            fs::try_exists(&dir).await.expect("dir lookup should succeed"),
+            fs::try_exists(&dir)
+                .await
+                .expect("dir lookup should succeed"),
             "stale cleanup should not delete active download dir"
         );
 
         cleanup_download_dir(dir.clone(), second).await;
         assert!(
-            !fs::try_exists(&dir).await.expect("dir lookup should succeed"),
+            !fs::try_exists(&dir)
+                .await
+                .expect("dir lookup should succeed"),
             "latest cleanup should remove the download dir"
         );
     }
@@ -573,7 +709,9 @@ mod tests {
     #[tokio::test]
     async fn stores_and_reloads_the_exact_downloaded_filepath() {
         let dir = unique_temp_dir("download-marker");
-        fs::create_dir_all(&dir).await.expect("dir should be created");
+        fs::create_dir_all(&dir)
+            .await
+            .expect("dir should be created");
         let file = dir.join("clip.mp4");
         fs::write(&file, b"video")
             .await
@@ -589,7 +727,9 @@ mod tests {
 
         assert_eq!(loaded, file);
 
-        fs::remove_dir_all(&dir).await.expect("dir should be removed");
+        fs::remove_dir_all(&dir)
+            .await
+            .expect("dir should be removed");
     }
 
     #[test]
@@ -625,5 +765,26 @@ mod tests {
         let resolved = resolve_ytdlp_command(Path::new("yt-dlp"))
             .expect("plain command names should be accepted");
         assert_eq!(resolved, OsString::from("yt-dlp"));
+    }
+
+    #[test]
+    fn classifies_login_gated_extractor_failures() {
+        let error = anyhow::anyhow!(
+            "yt-dlp failed: ERROR: [TikTok] post: Log in for access. Use --cookies-from-browser or --cookies"
+        );
+
+        assert_eq!(
+            classify_failure(&error),
+            YtDlpFailureKind::AuthenticationRequired
+        );
+    }
+
+    #[test]
+    fn classifies_drm_protected_extractor_failures() {
+        let error = anyhow::anyhow!(
+            "yt-dlp failed: ERROR: [DRM] The requested site is known to use DRM protection"
+        );
+
+        assert_eq!(classify_failure(&error), YtDlpFailureKind::DrmProtected);
     }
 }

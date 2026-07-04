@@ -37,6 +37,14 @@ impl ApiError {
         }
     }
 
+    pub fn unprocessable(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code,
+            message: message.into(),
+        }
+    }
+
     pub fn service_unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
